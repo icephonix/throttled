@@ -1,6 +1,10 @@
 import configparser
 import importlib.util
+import io
+import subprocess
+import sys
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -37,6 +41,18 @@ class MsrEncodingTests(unittest.TestCase):
             msr = throttled.calc_undervolt_msr('CORE', offset_mv)
             self.assertEqual(throttled.calc_undervolt_mv(msr & 0xFFFFFFFF), offset_mv)
 
+    def test_undervolt_encoder_rejects_values_outside_signed_eleven_bits(self):
+        throttled = load_throttled()
+
+        with self.assertRaisesRegex(ValueError, 'between -1000 and 0 mV'):
+            throttled.calc_undervolt_msr('CORE', -1001)
+        with self.assertRaisesRegex(ValueError, 'between -1000 and 0 mV'):
+            throttled.calc_undervolt_msr('CORE', 1)
+        for invalid in (float('nan'), float('inf'), float('-inf')):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, 'between -1000 and 0 mV'):
+                    throttled.calc_undervolt_msr('CORE', invalid)
+
     def test_trip_offset_is_clamped_to_the_six_bit_msr_field(self):
         throttled = load_throttled()
         config = make_config(
@@ -60,8 +76,96 @@ class MsrEncodingTests(unittest.TestCase):
         throttled = load_throttled()
 
         self.assertEqual(throttled.calc_icc_max_msr('CORE', 0x3FF / 4) & 0x3FF, 0x3FF)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             throttled.calc_icc_max_msr('CORE', 256)
+
+    def test_package_power_limit_encoder_rejects_field_spill(self):
+        throttled = load_throttled()
+
+        value = throttled._encode_pkg_power_limit(0x7FFF, 0x7F, 0x7FFF, 0x7F)
+        self.assertEqual(
+            value,
+            0x7FFF | (1 << 15) | (1 << 16) | (0x7F << 17) | (0x7FFF << 32) | (1 << 47) | (0x7F << 49),
+        )
+        with self.assertRaisesRegex(ValueError, 'PL1'):
+            throttled._encode_pkg_power_limit(0x8000, 0, 1, 0)
+        with self.assertRaisesRegex(ValueError, 'PL1 must be at least one power-unit tick'):
+            throttled._encode_pkg_power_limit(0, 0, 1, 0)
+        with self.assertRaisesRegex(ValueError, 'PL2'):
+            throttled._encode_pkg_power_limit(1, 0, 0x8000, 0)
+        with self.assertRaisesRegex(ValueError, 'PL2 must be at least one power-unit tick'):
+            throttled._encode_pkg_power_limit(1, 0, 0, 0)
+        throttled._encode_pkg_power_limit(1, 0, 1, 0)
+
+    def test_calculated_package_power_limit_rejects_unencodable_wattage(self):
+        throttled = load_throttled()
+        config = make_config(
+            {
+                'GENERAL': {'Enabled': 'True'},
+                'AC': {
+                    'Update_Rate_s': '5',
+                    'PL1_Tdp_W': str(0x8000),
+                    'PL1_Duration_s': '1',
+                    'PL2_Tdp_W': '20',
+                    'PL2_Duration_s': '1',
+                },
+            }
+        )
+        platform_info = {
+            'feature_programmable_temperature_target': 0,
+            'feature_programmable_tdp_limit': 0,
+        }
+
+        stderr = io.StringIO()
+        with mock.patch.object(throttled, 'get_power_unit', return_value=1):
+            with mock.patch.object(
+                throttled,
+                'get_cur_pkg_power_limits',
+                return_value={'PL1': 0, 'TW1': 0, 'PL2': 0, 'TW2': 0},
+            ):
+                with mock.patch.object(throttled, 'calc_time_window_vars', return_value=(0, 0)):
+                    with mock.patch.object(throttled, 'warning'):
+                        with redirect_stderr(stderr):
+                            with self.assertRaises(SystemExit):
+                                throttled.calc_reg_values(platform_info, config)
+
+        self.assertIn('PL1', stderr.getvalue())
+
+    def test_icc_max_encoder_rejects_malformed_planes_and_currents(self):
+        throttled = load_throttled()
+
+        self.assertEqual(throttled.calc_icc_max_msr('CORE', 100) & 0x3FF, 400)
+        with self.assertRaisesRegex(ValueError, 'plane'):
+            throttled.calc_icc_max_msr('UNCORE', 100)
+        with self.assertRaisesRegex(ValueError, '10-bit'):
+            throttled.calc_icc_max_msr('CORE', 0.1)
+        for invalid in (0, -1, 255.76, float('nan'), float('inf'), 'abc'):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    throttled.calc_icc_max_msr('CORE', invalid)
+
+    def test_icc_max_validation_survives_python_optimize(self):
+        code = (
+            'import throttled\n'
+            'try:\n'
+            '    throttled.calc_icc_max_msr("CORE", 256)\n'
+            'except ValueError:\n'
+            '    raise SystemExit(0)\n'
+            'raise SystemExit(1)\n'
+        )
+        result = subprocess.run([sys.executable, '-O', '-c', code], cwd=ROOT, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+    def test_iccmax_encoder_floors_offgrid_values_to_the_configured_ceiling(self):
+        throttled = load_throttled()
+
+        # exact grid values encode unchanged
+        self.assertEqual(throttled.calc_icc_max_msr('CORE', 0.25) & 0x3FF, 1)
+        self.assertEqual(throttled.calc_icc_max_msr('CORE', 255.75) & 0x3FF, 0x3FF)
+        # off-grid values quantise DOWN, never above the configured ceiling
+        self.assertEqual(throttled.calc_icc_max_msr('CORE', 105.4) & 0x3FF, 421)
+        self.assertEqual(throttled.calc_icc_max_msr('CORE', 200.9) & 0x3FF, 803)
 
 
 if __name__ == '__main__':
